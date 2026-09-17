@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: restroom-db
+    environment:
+      POSTGRES_USER: restroom
+      POSTGRES_PASSWORD: restroom_pass
+      POSTGRES_DB: restroom
+      TZ: Asia/Shanghai
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U restroom -d restroom']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    # 每次都从当前源码重新构建：不同题/不同工作区共用同一批镜像 tag，
+    # 若沿用已有镜像会跑到上一份代码，这里强制 build（BuildKit 缓存仍在，没改就很快）
+    pull_policy: build
+    container_name: restroom-backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://restroom:restroom_pass@db:5432/restroom
+      SEED_ON_STARTUP: 'true'
+      CORS_ORIGINS: '*'
+      TZ: Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '8000:8000'
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    pull_policy: build
+    container_name: restroom-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - '8080:80'
+    restart: unless-stopped
+
+volumes:
+  db_data:

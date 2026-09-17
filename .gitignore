@@ -1,0 +1,44 @@
+# 日志和输出
+*.log
+*.err
+*.out
+*.pid
+*.seed
+
+# 依赖
+node_modules/
+__pycache__/
+*.pyc
+vendor/
+dist/
+build/
+
+# 环境变量和密钥
+.env
+.env.*
+*.key
+*.pem
+secrets/
+config.local.*
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# Claude 相关（重要！）
+.claude/
+.agents/
+.codex/
+memory/
+skills/
+traces/
+
+
+db.sqlite3
+*.sqlite3
+.venv
