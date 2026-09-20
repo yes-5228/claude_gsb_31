@@ -42,3 +42,6 @@ traces/
 db.sqlite3
 *.sqlite3
 .venv
+
+# 后端运行时 SQLite 数据（含 WAL 文件）
+backend/data/

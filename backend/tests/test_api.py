@@ -208,6 +208,91 @@ def test_issue_requires_matching_restroom(client, restroom):
     assert "不一致" in mismatch.json()["detail"]
 
 
+def test_issue_code_continues_after_delete(client, restroom):
+    created = []
+    for index in range(3):
+        response = client.post(
+            "/api/v1/issues",
+            json={"restroom_id": restroom["id"], "title": f"编号连续性{index}"},
+        )
+        assert response.status_code == 201, response.text
+        created.append(response.json())
+
+    prefix = datetime.now().strftime("WT-%Y%m%d-")
+    assert all(item["code"].startswith(prefix) for item in created)
+    seqs = [int(item["code"].rsplit("-", 1)[1]) for item in created]
+    assert seqs == [seqs[0], seqs[0] + 1, seqs[0] + 2]
+
+    # 删掉最新一条后再建：不复用已释放的编号，也不因条数减少而跳号
+    assert client.delete(f"/api/v1/issues/{created[2]['id']}").status_code == 200
+    for expected in (seqs[2] + 1, seqs[2] + 2):
+        response = client.post(
+            "/api/v1/issues", json={"restroom_id": restroom["id"], "title": "删除后再建"}
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["code"] == f"{prefix}{expected:03d}"
+
+    # 历史编号保持不变
+    remaining = client.get(f"/api/v1/issues/{created[0]['id']}").json()
+    assert remaining["code"] == created[0]["code"]
+
+
+def test_issue_code_follows_report_time(client, restroom):
+    biz_time = (datetime.now() - timedelta(days=1)).replace(hour=23, minute=58)
+    first = client.post(
+        "/api/v1/issues",
+        json={
+            "restroom_id": restroom["id"],
+            "title": "跨零点补录一",
+            "report_time": biz_time.isoformat(),
+        },
+    )
+    assert first.status_code == 201, first.text
+    prefix = biz_time.strftime("WT-%Y%m%d-")
+    assert first.json()["code"].startswith(prefix)
+
+    second = client.post(
+        "/api/v1/issues",
+        json={
+            "restroom_id": restroom["id"],
+            "title": "跨零点补录二",
+            "report_time": biz_time.replace(minute=59).isoformat(),
+        },
+    )
+    assert second.status_code == 201, second.text
+    first_seq = int(first.json()["code"].rsplit("-", 1)[1])
+    second_seq = int(second.json()["code"].rsplit("-", 1)[1])
+    assert second_seq == first_seq + 1
+
+
+def test_issue_code_concurrent_allocation(client, restroom):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.core.database import SessionLocal
+    from app.schemas.issue import IssueCreate
+    from app.services import issue_service
+
+    def create_one(index: int) -> str:
+        db = SessionLocal()
+        try:
+            issue = issue_service.create_issue(
+                db, IssueCreate(restroom_id=restroom["id"], title=f"并发上报{index}")
+            )
+            return issue.code
+        finally:
+            db.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(create_one, range(8)))
+
+    # 并发提交：编号不重复、序号连续不漏号
+    assert len(set(codes)) == 8
+    prefix = datetime.now().strftime("WT-%Y%m%d-")
+    assert all(code.startswith(prefix) for code in codes)
+    seqs = sorted(int(code.rsplit("-", 1)[1]) for code in codes)
+    assert seqs == list(range(seqs[0], seqs[0] + 8))
+
+
 def test_dashboard_stats(client, restroom):
     payload = client.get("/api/v1/stats/dashboard", params={"trend_days": 7}).json()
     overview = payload["overview"]

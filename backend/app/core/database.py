@@ -4,7 +4,7 @@ import os
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
@@ -36,6 +36,15 @@ engine = create_engine(
     pool_pre_ping=True,
     connect_args=_connect_args(settings.database_url),
 )
+
+if settings.database_url.startswith("sqlite"):
+
+    @event.listens_for(engine, "connect")
+    def _sqlite_wal(dbapi_connection, _connection_record):
+        """WAL 模式下读写互不阻塞，并发写按提交顺序串行，避免偶发 database is locked。"""
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.close()
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 

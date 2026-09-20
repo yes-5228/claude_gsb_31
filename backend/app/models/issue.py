@@ -56,6 +56,21 @@ class Issue(Base):
     )
 
 
+class IssueCodeCounter(Base):
+    """按编号前缀记录已分配的最大序号。
+
+    编号不再依赖问题条数：序号只增不减，删除问题不回退，
+    自增与建单在同一事务内完成，并发提交不重号、不漏号。
+    """
+
+    __tablename__ = "issue_code_counters"
+
+    prefix: Mapped[str] = mapped_column(
+        String(16), primary_key=True, comment="编号前缀，如 WT-20260920"
+    )
+    last_seq: Mapped[int] = mapped_column(Integer, default=0, comment="已分配的最大序号")
+
+
 class RectificationRecord(Base):
     """问题整改流水，用于还原完整的整改闭环轨迹。"""
 

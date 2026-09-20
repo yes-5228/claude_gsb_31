@@ -2,7 +2,8 @@
 
 from datetime import date, datetime, time
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.constants import (
@@ -12,7 +13,7 @@ from app.core.constants import (
     IssueStatus,
 )
 from app.core.exceptions import DomainError, NotFoundError
-from app.models import Inspection, Issue, RectificationRecord, Restroom
+from app.models import Inspection, Issue, IssueCodeCounter, RectificationRecord, Restroom
 from app.schemas.issue import IssueCreate, IssueOut, IssueStatusUpdate, IssueUpdate
 from app.services import restroom_service
 
@@ -26,19 +27,50 @@ SORTABLE_FIELDS = {
 }
 
 
-def _next_code(db: Session) -> str:
-    prefix = datetime.now().strftime("WT-%Y%m%d")
-    seq = (
-        db.scalar(
-            select(func.count()).select_from(Issue).where(Issue.code.like(f"{prefix}-%"))
+def _max_existing_seq(db: Session, prefix: str) -> int:
+    """该前缀下历史编号的最大序号，用于计数器首次初始化（兼容旧逻辑生成的编号）。"""
+    codes = db.scalars(select(Issue.code).where(Issue.code.like(f"{prefix}-%"))).all()
+    seqs = []
+    for code in codes:
+        try:
+            seqs.append(int(code.rsplit("-", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return max(seqs, default=0)
+
+
+def _next_seq(db: Session, prefix: str) -> int:
+    """为指定前缀原子分配下一个序号。
+
+    计数器自增与建单在同一事务：行锁让并发事务依次取号，
+    事务回滚时序号自动归还，因此并发提交既不重复也不漏号。
+    """
+    for _ in range(5):
+        result = db.execute(
+            update(IssueCodeCounter)
+            .where(IssueCodeCounter.prefix == prefix)
+            .values(last_seq=IssueCodeCounter.last_seq + 1)
         )
-        or 0
-    ) + 1
-    while True:
-        code = f"{prefix}-{seq:03d}"
-        if not db.scalar(select(Issue.id).where(Issue.code == code)):
-            return code
-        seq += 1
+        if result.rowcount:
+            return db.scalar(
+                select(IssueCodeCounter.last_seq).where(IssueCodeCounter.prefix == prefix)
+            )
+        # 该前缀首次分配：从历史最大序号接续，避免与存量编号冲突
+        seq = _max_existing_seq(db, prefix) + 1
+        try:
+            with db.begin_nested():
+                db.add(IssueCodeCounter(prefix=prefix, last_seq=seq))
+                db.flush()
+        except IntegrityError:
+            continue  # 并发事务已抢先创建计数行，回到自增路径
+        return seq
+    raise DomainError("问题编号分配失败，请稍后重试")
+
+
+def _next_code(db: Session, biz_time: datetime) -> str:
+    """按业务时间归属日期生成编号，跨零点补录时与上报日期保持一致。"""
+    prefix = biz_time.strftime("WT-%Y%m%d")
+    return f"{prefix}-{_next_seq(db, prefix):03d}"
 
 
 def _values(data: dict) -> dict:
@@ -144,10 +176,11 @@ def create_issue(db: Session, payload: IssueCreate) -> Issue:
             raise DomainError("关联的巡查记录与所选公厕不一致")
 
     data = _values(payload.model_dump(exclude={"inspection_id", "report_time", "initial_remark"}))
+    report_time = payload.report_time or datetime.now()
     issue = Issue(
-        code=_next_code(db),
+        code=_next_code(db, report_time),
         inspection_id=payload.inspection_id,
-        report_time=payload.report_time or datetime.now(),
+        report_time=report_time,
         status=IssueStatus.PENDING.value,
         **data,
     )
