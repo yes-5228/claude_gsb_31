@@ -1,7 +1,12 @@
 """接口级测试：覆盖台账、巡查、问题整改与统计看板。"""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
+from app.core.database import SessionLocal
+from app.models import Issue, IssueCodeSequence
+from app.schemas.issue import IssueCreate
+from app.services import issue_service
 from tests.conftest import full_items
 
 
@@ -223,3 +228,86 @@ def test_dashboard_stats(client, restroom):
     }
     assert payload["top_restrooms"]
     assert "rectification_rate" in overview
+
+
+def _create_issue_payload(restroom_id: int, title: str, report_time: datetime | None = None) -> dict:
+    payload = {"restroom_id": restroom_id, "title": title}
+    if report_time is not None:
+        payload["report_time"] = report_time.isoformat()
+    return payload
+
+
+def test_issue_code_uses_business_time_and_never_reuses_deleted_code(client, restroom):
+    historical_time = datetime(2000, 1, 2, 23, 59)
+    first = client.post(
+        "/api/v1/issues",
+        json=_create_issue_payload(restroom["id"], "跨零点前业务时间", historical_time),
+    ).json()
+    assert first["code"] == "WT-20000102-001"
+
+    after_midnight = datetime(2000, 1, 3, 0, 1)
+    second = client.post(
+        "/api/v1/issues",
+        json=_create_issue_payload(restroom["id"], "跨零点后业务时间", after_midnight),
+    ).json()
+    assert second["code"] == "WT-20000103-001"
+
+    assert client.delete(f"/api/v1/issues/{first['id']}").status_code == 200
+    third = client.post(
+        "/api/v1/issues",
+        json=_create_issue_payload(restroom["id"], "删除后继续递增", historical_time),
+    ).json()
+    assert third["code"] == "WT-20000102-002"
+    assert client.get(f"/api/v1/issues/{first['id']}").status_code == 404
+
+
+def test_issue_code_initializes_from_existing_historical_code(client, restroom):
+    historical_time = datetime(2001, 2, 3, 10, 0)
+    legacy_code = "WT-20010203-007"
+
+    with SessionLocal() as db:
+        db.add(
+            Issue(
+                code=legacy_code,
+                restroom_id=restroom["id"],
+                title="历史编号问题",
+                report_time=historical_time,
+                status="待整改",
+            )
+        )
+        db.commit()
+
+    created = client.post(
+        "/api/v1/issues",
+        json=_create_issue_payload(restroom["id"], "沿用历史最大流水", historical_time),
+    ).json()
+    assert created["code"] == "WT-20010203-008"
+
+    with SessionLocal() as db:
+        counter = db.get(IssueCodeSequence, historical_time.date())
+        assert counter is not None
+        assert counter.last_value == 8
+
+
+def test_concurrent_issue_code_allocation_has_no_duplicates_or_gaps(restroom):
+    report_time = datetime(2002, 3, 4, 9, 0)
+    total = 20
+
+    def create_issue(index: int) -> str:
+        with SessionLocal() as db:
+            issue = issue_service.create_issue(
+                db,
+                IssueCreate(
+                    restroom_id=restroom["id"],
+                    title=f"并发问题 {index}",
+                    report_time=report_time,
+                ),
+            )
+            return issue.code
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        codes = list(executor.map(create_issue, range(total)))
+
+    assert len(codes) == total
+    assert len(set(codes)) == total
+    assert set(codes) == {f"WT-20020304-{sequence:03d}" for sequence in range(1, total + 1)}

@@ -3,6 +3,8 @@
 from datetime import date, datetime, time
 
 from sqlalchemy import func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.core.constants import (
@@ -12,7 +14,13 @@ from app.core.constants import (
     IssueStatus,
 )
 from app.core.exceptions import DomainError, NotFoundError
-from app.models import Inspection, Issue, RectificationRecord, Restroom
+from app.models import (
+    Inspection,
+    Issue,
+    IssueCodeSequence,
+    RectificationRecord,
+    Restroom,
+)
 from app.schemas.issue import IssueCreate, IssueOut, IssueStatusUpdate, IssueUpdate
 from app.services import restroom_service
 
@@ -26,19 +34,50 @@ SORTABLE_FIELDS = {
 }
 
 
-def _next_code(db: Session) -> str:
-    prefix = datetime.now().strftime("WT-%Y%m%d")
-    seq = (
-        db.scalar(
-            select(func.count()).select_from(Issue).where(Issue.code.like(f"{prefix}-%"))
+def _code_prefix(issue_date: date) -> str:
+    return f"WT-{issue_date:%Y%m%d}"
+
+
+def _existing_max_sequence(db: Session, prefix: str) -> int:
+    """按历史编号初始化流水，已生成的历史编号保持不变。"""
+    codes = list(db.scalars(select(Issue.code).where(Issue.code.like(f"{prefix}-%"))))
+    max_sequence = 0
+    for code in codes:
+        suffix = code.removeprefix(f"{prefix}-")
+        if suffix.isdigit():
+            max_sequence = max(max_sequence, int(suffix))
+    return max_sequence
+
+
+def _next_code(db: Session, issue_time: datetime) -> str:
+    """基于按日计数器原子分配编号；删除问题不会复用或重排历史流水。"""
+    issue_date = issue_time.date()
+    prefix = _code_prefix(issue_date)
+    counter_exists = db.scalar(
+        select(IssueCodeSequence.issue_date).where(
+            IssueCodeSequence.issue_date == issue_date
         )
-        or 0
-    ) + 1
-    while True:
-        code = f"{prefix}-{seq:03d}"
-        if not db.scalar(select(Issue.id).where(Issue.code == code)):
-            return code
-        seq += 1
+    )
+    initial_value = 0 if counter_exists else _existing_max_sequence(db, prefix)
+
+    dialect_name = db.bind.dialect.name
+    if dialect_name == "postgresql":
+        insert = pg_insert
+    elif dialect_name == "sqlite":
+        insert = sqlite_insert
+    else:
+        raise RuntimeError(f"问题编号计数器暂不支持 {dialect_name} 数据库")
+
+    statement = insert(IssueCodeSequence).values(
+        issue_date=issue_date, last_value=initial_value + 1
+    )
+    # 仅首个未命中冲突的插入使用历史最大值；后续并发请求必须走原子递增。
+    statement = statement.on_conflict_do_update(
+        index_elements=["issue_date"],
+        set_={"last_value": IssueCodeSequence.last_value + 1},
+    ).returning(IssueCodeSequence.last_value)
+    sequence = db.scalar(statement)
+    return f"{prefix}-{sequence:03d}"
 
 
 def _values(data: dict) -> dict:
@@ -144,10 +183,11 @@ def create_issue(db: Session, payload: IssueCreate) -> Issue:
             raise DomainError("关联的巡查记录与所选公厕不一致")
 
     data = _values(payload.model_dump(exclude={"inspection_id", "report_time", "initial_remark"}))
+    report_time = payload.report_time or datetime.now()
     issue = Issue(
-        code=_next_code(db),
+        code=_next_code(db, report_time),
         inspection_id=payload.inspection_id,
-        report_time=payload.report_time or datetime.now(),
+        report_time=report_time,
         status=IssueStatus.PENDING.value,
         **data,
     )

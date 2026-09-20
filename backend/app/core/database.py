@@ -4,7 +4,7 @@ import os
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
@@ -36,6 +36,23 @@ engine = create_engine(
     pool_pre_ping=True,
     connect_args=_connect_args(settings.database_url),
 )
+
+
+if settings.database_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+        dbapi_connection.isolation_level = None
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA busy_timeout = 30000")
+        cursor.execute("PRAGMA journal_mode = WAL")
+        cursor.close()
+
+    @event.listens_for(engine, "begin")
+    def _begin_sqlite_immediate(dbapi_connection) -> None:
+        # SQLite 默认事务为 DEFERRED，并发取号后再升级写锁可能互斥失败。
+        # 本地 SQLite 场景在事务开始即取写锁；生产 PostgreSQL 仍由行锁保证并发。
+        dbapi_connection.execute("BEGIN IMMEDIATE")
+
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 

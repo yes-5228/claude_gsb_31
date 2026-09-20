@@ -1,8 +1,8 @@
 """问题上报与整改跟踪模型。"""
 
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.constants import IssueCategory, IssueSeverity, IssueStatus
@@ -56,6 +56,15 @@ class Issue(Base):
     )
 
 
+class IssueCodeSequence(Base):
+    """按业务日期维护的问题编号流水，避免编号依赖现存问题数量。"""
+
+    __tablename__ = "issue_code_sequences"
+
+    issue_date: Mapped[date] = mapped_column(Date, primary_key=True, comment="编号归属业务日期")
+    last_value: Mapped[int] = mapped_column(Integer, nullable=False, comment="已分配的最大流水号")
+
+
 class RectificationRecord(Base):
     """问题整改流水，用于还原完整的整改闭环轨迹。"""
 
@@ -74,4 +83,4 @@ class RectificationRecord(Base):
         DateTime, default=datetime.now, index=True, comment="操作时间"
     )
 
-    issue: Mapped["Issue"] = relationship(back_populates="records")
+    issue: Mapped[Issue] = relationship(back_populates="records")

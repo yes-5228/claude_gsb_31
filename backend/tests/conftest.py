@@ -12,8 +12,10 @@ os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB.as_posix()}"
 os.environ["SEED_ON_STARTUP"] = "false"
 os.environ["CORS_ORIGINS"] = "*"
 
-if TEST_DB.exists():
-    TEST_DB.unlink()
+for suffix in ("", "-wal", "-shm"):
+    path = TEST_DB.with_name(TEST_DB.name + suffix)
+    if path.exists():
+        path.unlink()
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
